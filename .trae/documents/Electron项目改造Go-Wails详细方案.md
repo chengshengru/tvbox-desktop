@@ -143,7 +143,7 @@ graph TB
         APP["App 绑定结构体<br/>app.go（45 个方法）"]
         SVC["internal/* 服务层<br/>（20 个包，翻译自 services）"]
         STORE["internal/store<br/>JSON 持久化（data/）"]
-        MEDIA["internal/mediaproxy<br/>★ 本地媒体反代 127.0.0.1"]
+        MW["internal/mediamw<br/>★ AssetServer 同源媒体中间件<br/>（不占端口）"]
         WEBVIEW["WebView2 宿主<br/>wails:// 内嵌前端资源"]
     end
     subgraph "前端（不变）"
@@ -158,8 +158,8 @@ graph TB
     APP -- 函数调用 --> SVC
     ADAPTER -- "EventsOn('search:progress')" -. 事件推送 .-> APP
     SVC -- "net/http + goquery + x/text" --> NET
-    RD -- "hls.js / <img> 全部改指 127.0.0.1" --> MEDIA
-    MEDIA -- "注入 Referer/UA + 重写 m3u8 URI" --> NET
+    RD -- "hls.js / <img> 改指同源 /media?u=" --> MW
+    MW -- "注入 Referer/UA + 重写 m3u8 URI" --> NET
     WEBVIEW --- RD
     SVC --> STORE
     APP -- os/exec --> EXT
@@ -179,37 +179,37 @@ graph LR
         W1["Go 进程<br/>(含 Wails 服务器)"]
         W2["JS Bindings<br/>window.go.* + runtime"]
         W3[WebView2]
-        W4["本地媒体反代<br/>（解决 CORS + Referer）"]
+        W4["AssetServer 同源媒体中间件<br/>（解决 CORS + Referer，不占端口）"]
     end
     E1 -->|服务层翻译为 Go 包| W1
     E2 -->|适配层保形重写| W2
     E3 -->|原样保留| W3
-    E4 -->|能力迁入 Go 反代| W4
+    E4 -->|能力迁入同源中间件| W4
 ```
 
-**核心思想**：Electron 里"渲染进程直连第三方站点"的通路（靠关安全策略放行）在 Wails 里**整体收编到 Go 侧**——所有第三方媒体流量走本地反代，一并解决 CORS、Referer 防盗链、编码、系统代理四个问题。这是与 Electron 最大的架构差异，也是本方案的关键决策。
+**核心思想**：Electron 里"渲染进程直连第三方站点"的通路（靠关安全策略放行）在 Wails 里**整体收编到 Go 侧**——所有第三方媒体流量改走前端同源路径 `/media?u=...`，由 Wails AssetServer 中间件在 Go 进程内转发，一并解决 CORS、Referer 防盗链、编码、系统代理四个问题，且**进程不监听任何 TCP 端口**。这是与 Electron 最大的架构差异，也是本方案的关键决策。
 
-### 4.3 媒体反代时序（直播播放为例）
+### 4.3 同源媒体转发时序（直播播放为例）
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
     participant FE as 前端 hls.js
-    participant PX as Go 媒体反代 127.0.0.1:P
+    participant GO as Go 进程（绑定+同源中间件）
     participant Huya as 虎牙边缘节点
 
     U->>FE: 点开 huya://房间号 频道
-    FE->>PX: GET /resolve?url=huya://xxx (binding 亦可)
-    PX-->>FE: 真 m3u8 地址（streamResolve 逻辑）
-    FE->>PX: GET /media?u=<播放列表地址>
-    PX->>Huya: GET 带 Referer/UA（headersFor 规则）
-    Huya-->>PX: #EXTM3U 内容
-    PX-->>FE: 重写后的播放列表<br/>（所有分片 URI → /media?u=绝对地址）
+    FE->>GO: binding Live.Resolve("huya://xxx")
+    GO-->>FE: 真 m3u8 地址（streamResolve 逻辑）
+    FE->>GO: GET /media?u=<播放列表地址>（同源相对路径，无端口）
+    GO->>Huya: GET 带 Referer/UA（headersFor 规则）
+    Huya-->>GO: #EXTM3U 内容
+    GO-->>FE: 重写后的播放列表<br/>（所有分片 URI → /media?u=绝对地址）
     loop 每个分片
-        FE->>PX: GET /media?u=<ts 地址>
-        PX->>Huya: GET + Referer
-        Huya-->>PX: 200 video/MP2T
-        PX-->>FE: 透传分片字节
+        FE->>GO: GET /media?u=<ts 地址>
+        GO->>Huya: GET + Referer
+        Huya-->>GO: 200 video/MP2T
+        GO-->>FE: 透传分片字节
     end
 ```
 
@@ -221,23 +221,26 @@ sequenceDiagram
 
 **问题**：Wails 前端页面运行在 `wails://`（或内部 localhost）源上，hls.js 的 XHR 拉第三方 m3u8/分片、`<img>` 之外的 fetch 类请求都会被 WebView2 的 CORS 拦截。Electron 用关闭安全策略绕过，Wails 不提供该开关。
 
-**方案：Go 本地媒体反向代理（`internal/mediaproxy`）**
+**方案：Wails AssetServer 中间件做同源媒体转发（`internal/mediamw`，不占端口）**
 
-- 应用启动时在 `127.0.0.1` 上以**随机端口**起一个 `net/http` 服务（`OnStartup` 钩子内启动，端口经绑定方法 `App.MediaProxyPort()` 或启动参数注入前端）。
-- 路由设计：
-  - `GET /media?u=<urlencoded 原始地址>`：透传任意第三方资源（m3u8、ts 分片、mp4、海报图），按 `headersFor()` 规则注入 Referer/UA/Origin，支持 Range 请求透传（外部 `<video>` 拖拽需要）。
-  - 对 `Content-Type: application/vnd.apple.mpegurl` / `.m3u8` 响应体做 **URI 重写**：把相对/绝对分片地址全部改写为 `/media?u=...`，让 hls.js 后续请求天然落在同源反代内。
+Wails 的 AssetServer 官方支持 `assetserver.Middleware` 挂进请求链（见文末 Sources）。页面本身由 AssetServer 经 WebView2 资源拦截在**进程内**提供，不建立 TCP 监听，因此给前端加一条同源路径即可完成媒体转发，全程零端口占用：
+
+- 路由设计（全部是页面同源相对路径，不新增监听）：
+  - `GET /media?u=<urlencoded 原始地址>`：中间件识别 `/media` 前缀后，用 Go `net/http` 透传任意第三方资源（m3u8、ts 分片、mp4、海报图），按 `headersFor()` 规则注入 Referer/UA/Origin，支持 Range 请求透传（外部 `<video>` 拖拽需要）。
+  - 对 `Content-Type: application/vnd.apple.mpegurl` / `.m3u8` 响应体做 **URI 重写**：把相对/绝对分片地址全部改写为同源 `/media?u=...`，让 hls.js 后续请求天然落在中间件内。
 - 前端接入点（改动集中在两处工具文件）：
-  - [utils/media.ts](../../src/renderer/src/utils/media.ts) / [utils/artplayer.ts](../../src/renderer/src/utils/artplayer.ts)：播放地址统一过 `toProxyUrl()`；
-  - [components/Poster.tsx](../../src/renderer/src/components/Poster.tsx) 等海报 `<img>`：`<img src>` 本身不受 CORS 限制，**可不改**；但为统一处理防盗链 Referer（部分图床校验 Referer），建议一并走反代。
+  - [utils/media.ts](../../src/renderer/src/utils/media.ts) / [utils/artplayer.ts](../../src/renderer/src/utils/artplayer.ts)：播放地址统一过 `toProxyUrl()`（产出**同源相对路径** `/media?u=...`）；
+  - [components/Poster.tsx](../../src/renderer/src/components/Poster.tsx) 等海报 `<img>`：`<img src>` 本身不受 CORS 限制，**可不改**；但为统一处理防盗链 Referer（部分图床校验 Referer），建议一并走中间件。
+- 开发模式说明：`wails3 dev` 下页面源是 Vite dev server（开发期本就占用端口，与现版 `npm run dev` 相同），给 Vite 配置加一条中间件插件把 `/media` 转给 Go 侧即可；**生产运行不监听任何端口**。
+- 平台差异与退路：Windows/WebView2 走进程内资源拦截无端口；若个别平台（macOS/Linux）的中间件能力受限，退路见 11.1 R9（hls.js 自定义 loader 经 binding 取字节，同样无端口）。
 
-**收益**：CORS、Referer 注入（难点二）、系统代理（难点三）三个问题被同一个组件收编，前端不再需要任何"关安全策略"式的特殊豁免。
+**收益**：CORS、Referer 注入（难点二）、系统代理（难点三）三个问题被同一个组件收编，且**不新增任何监听端口**，前端不再需要任何"关安全策略"式的特殊豁免。
 
 ### 5.2 难点二：Referer 防盗链注入
 
 **问题**：Electron 用 `webRequest.onBeforeSendHeaders` 给虎牙/抖音域名补 Referer（[main/index.ts#L293-L300](../../src/main/index.ts)），因为 `Referer` 是 forbidden header，hls.js 无法自行设置。
 
-**方案**：`streamResolve.ts` 中的 `headersFor(url)` 规则表**原样翻译为 Go**（`internal/stream` 包导出），由 5.1 的反代在转发前查表注入。规则只按域名后缀匹配（虎牙会把域名改写进 path，逻辑保留原注释里的坑位说明）。前端不再需要任何 header 注入能力。
+**方案**：`streamResolve.ts` 中的 `headersFor(url)` 规则表**原样翻译为 Go**（`internal/stream` 包导出），由 5.1 的同源中间件在转发前查表注入。规则只按域名后缀匹配（虎牙会把域名改写进 path，逻辑保留原注释里的坑位说明）。前端不再需要任何 header 注入能力。
 
 ### 5.3 难点三：系统代理可达性探测
 
@@ -245,7 +248,7 @@ sequenceDiagram
 
 **方案**：职责拆分——
 1. **Go 出站流量**（搜索/详情/解析等，占绝大多数）：`net/http` 默认 `http.ProxyFromEnvironment`；启动时用 Go 重写"探测代理端口 TCP 可达性，不可达则 Transport 强制 `Proxy=nil` 直连"，逻辑与现版一致（`net.Dialer` 800ms 超时）。Windows 下系统代理从注册表 `Internet Settings` 或 `winhttp` 读取，封装成 `internal/proxy`。
-2. **WebView 流量**：媒体流量已全部走反代同源请求，WebView 不再直连第三方，Chromium 代理故障面基本消除，无需等价机制。
+2. **WebView 流量**：媒体流量已全部走同源 `/media` 中间件，WebView 不再直连第三方，Chromium 代理故障面基本消除，无需等价机制。
 
 ### 5.4 难点四：事件推送（search:progress）
 
@@ -279,7 +282,7 @@ sequenceDiagram
 
 ### 5.7 注意点：AI 多模态帧传输
 
-现有链路：渲染进程 `<video>` 抽帧（[utils/frames.ts](../../src/renderer/src/utils/frames.ts)）→ IPC 传 base64 数组 → 主进程拼 OpenAI 兼容请求。Wails 的 binding 对大 payload（140 帧 base64 可能达数 MB）走 JSON 序列化，**性能可接受但建议**：抽帧上限与压缩质量沿用现值（`MAX_FRAMES=140`），并实测一次视觉总结的端到端耗时；若 binding 传输成为瓶颈，退路是抽帧结果先 POST 到媒体反代新增的 `POST /ai-frames` 暂存接口，binding 只传句柄。
+现有链路：渲染进程 `<video>` 抽帧（[utils/frames.ts](../../src/renderer/src/utils/frames.ts)）→ IPC 传 base64 数组 → 主进程拼 OpenAI 兼容请求。Wails 的 binding 对大 payload（140 帧 base64 可能达数 MB）走 JSON 序列化，**性能可接受但建议**：抽帧上限与压缩质量沿用现值（`MAX_FRAMES=140`），并实测一次视觉总结的端到端耗时；若 binding 传输成为瓶颈，退路是抽帧结果先 POST 到同源中间件新增的 `POST /ai-frames` 暂存路径，binding 只传句柄。
 
 ---
 
@@ -291,7 +294,7 @@ sequenceDiagram
 tvbox-desktop/
 ├── wails-app/                        # ★ 新形态根目录
 │   ├── go.mod                        # module tvbox-desktop; go 1.26
-│   ├── main.go                       # Wails 装配：窗口/钩子/绑定/反代启动
+│   ├── main.go                       # Wails 装配：窗口/钩子/绑定/AssetServer 中间件注册
 │   ├── app.go                        # App 结构体：45 个绑定方法（薄壳，转发 internal/*）
 │   ├── events.go                     # 事件名常量（search:progress 等）
 │   ├── internal/
@@ -299,7 +302,7 @@ tvbox-desktop/
 │   │   ├── store/                    # ← services/store.ts
 │   │   ├── settings/                 # ← services/settings.ts
 │   │   ├── proxy/                    # ← services/proxy.ts
-│   │   ├── mediaproxy/               # ★ 新增：本地媒体反代
+│   │   ├── mediamw/                  # ★ 新增：AssetServer 同源媒体中间件（不占端口）
 │   │   ├── cms/                      # ← services/cms.ts
 │   │   ├── config/                   # ← services/config.ts
 │   │   ├── htmlrules/                # ← services/htmlRules.ts
@@ -345,7 +348,7 @@ graph TD
     A --> C[live / livehealth / stream]
     A --> D[parse / player / ai / library]
     A --> E[sources / presets / sites / settings]
-    A --> MP[mediaproxy]
+    A --> MP[mediamw]
     B --> CMS[cms + htmlrules]
     B --> E
     C --> E
@@ -404,7 +407,7 @@ Wails v3 绑定采用**按领域分组的结构体**（一个领域一个 `*Serv
 | Parse | `parse:list/resolve/test/add/remove/reset-stats` | `List/Resolve/Test/Add/Remove/ResetStats` |
 | Home | `home:sections` | `Sections(force bool)` |
 | Ai | `ai:summary` / `ai:summary-visual` | `Summarize(input)` / `SummarizeVisual(input, frames []models.AiFrame)` |
-| MediaProxy（新增） | — | `Port() int`（反代端口，前端启动时取一次并缓存） |
+| Media（新增） | — | **无绑定方法、无端口**；媒体经同源 `/media` 中间件路径访问（见 5.1） |
 
 事件通道（Go → 前端）：仅 `search:progress` 一个，与现版一致。
 
@@ -446,7 +449,7 @@ export const api = {
 
 | 文件 | 改动 | 原因 |
 |---|---|---|
-| `utils/media.ts` | 新增 `toProxyUrl(u)`：http(s) 媒体/海报地址改写为 `http://127.0.0.1:{port}/media?u=...`；端口来自 `api.mediaProxy.port()` 启动时缓存 | 5.1 反代接入 |
+| `utils/media.ts` | 新增 `toProxyUrl(u)`：http(s) 媒体/海报地址改写为**同源相对路径** `/media?u=...`（不涉端口） | 5.1 中间件接入 |
 | `utils/artplayer.ts` / `pages/Player.tsx` | 创建播放器前对播放地址调用 `toProxyUrl` | 同上 |
 | `pages/Live.tsx` | 直播播放地址同样过 `toProxyUrl` | 同上 |
 | `main.tsx` | 引入并挂载适配层；删除 Electron 环境假设 | 宿主切换 |
@@ -463,7 +466,7 @@ export const api = {
 
 ```mermaid
 graph LR
-    P0["阶段0<br/>脚手架+反代PoC"] --> P1["阶段1<br/>Go 基座"]
+    P0["阶段0<br/>脚手架+同源中间件PoC"] --> P1["阶段1<br/>Go 基座"]
     P1 --> P2["阶段2<br/>点播主链路"]
     P2 --> P3["阶段3<br/>直播+解析"]
     P3 --> P4["阶段4<br/>外围服务"]
@@ -473,10 +476,10 @@ graph LR
 
 | 阶段 | 内容 | 产出/退出条件 |
 |---|---|---|
-| 0 | `wails3 init` 建 `wails-app/`；迁移前端壳；**先做 mediaproxy PoC**：一条虎牙房间直播 + 一个 GBK 站点海报，验证 CORS/Referer/编码三件套 | PoC 能出画面、无 403/乱码，判定架构成立 |
+| 0 | `wails3 init` 建 `wails-app/`；迁移前端壳；**先做 mediamw 同源中间件 PoC**：一条虎牙房间直播 + 一个 GBK 站点海报，验证 CORS/Referer/编码三件套 | PoC 能出画面、无 403/乱码，且 `netstat -ano` 确认本进程无任何 LISTEN 端口，判定架构成立 |
 | 1 | 基座四件：`store`（含互斥锁与防抖落盘）、`settings`、`httputil`（含 `ParseLooseJSON`/编码嗅探）、`proxy`；`models` 全量类型 | 单测：store 读写并发安全、GBK/宽松 JSON 用例集通过 |
 | 2 | `cms/config/sources/presets/sites/htmlrules/search/detail/category/home`；`app.go` 对应绑定；事件推送 | 订阅→站点列表→搜索出结果→详情→分类浏览全链路可用，结果与 Electron 版逐站 diff |
-| 3 | `live/livehealth/stream/parse` + `mediaproxy` 完整实现（Range 透传、m3u8 URI 重写） | 直播分组/体检/播放、解析接口轮询换址可用 |
+| 3 | `live/livehealth/stream/parse` + `mediamw` 完整实现（Range 透传、m3u8 URI 重写） | 直播分组/体检/播放、解析接口轮询换址可用 |
 | 4 | `library/player/ai` + 窗口尺寸记忆 + 文件对话框 + 外链 | 收藏/历史、外部播放器拉起、AI 总结（含视觉）可用 |
 | 5 | 前端适配层全量接线（9.1/9.2），删除 Electron 专属分支 | 58 处调用零改动的验证报告；全功能手工冒烟 |
 | 6 | NSIS 安装包、体积/内存对比表、回归清单（11.2）执行、旧 `src/` 归档删除 | 验收标准（第 13 节）全部达成 |
@@ -493,12 +496,13 @@ graph LR
 |---|---|---|---|---|
 | R1 | WebView2 运行时在精简系统/旧 Windows 缺失 | 低 | 启动白屏 | 打包启用 Wails 官方 WebView2 bootstrapper；安装时检测 |
 | R2 | goquery 与 cheerio 选择器/文本规整差异导致字段抽取不一致 | 中 | 个别站点详情缺字段 | 阶段 2 建立"双跑对比"脚本：同一站点同一 id 两版输出 diff；差异集中在 `htmlrules` 的取值函数层修 |
-| R3 | 反代成为播放带宽瓶颈/分片延迟 | 低 | 卡顿 | Go `io.Copy` 流式透传 + 连接复用；本机回环带宽远超码率，PoC 阶段实测 4K 流 |
-| R4 | binding 大 payload（AI 140 帧）序列化慢 | 中 | AI 总结等待变长 | 5.7 退路：反代暂存接口传句柄 |
-| R5 | m3u8 变体（master playlist）改写复杂（虎牙边缘 IP 403 历史坑） | 中 | 直播个别线路黑屏 | 保留 `streamResolve` "优先 media、master 兜底"策略；反代对 master 的 `EXT-X-STREAM-INF` URI 同样改写 |
+| R3 | 中间件转发成为分片吞吐瓶颈 | 低 | 卡顿 | Go `io.Copy` 流式透传 + 连接复用；进程内转发无网络回环开销，PoC 阶段实测 4K 流 |
+| R4 | binding 大 payload（AI 140 帧）序列化慢 | 中 | AI 总结等待变长 | 5.7 退路：同源中间件 `/ai-frames` 暂存路径传句柄 |
+| R5 | m3u8 变体（master playlist）改写复杂（虎牙边缘 IP 403 历史坑） | 中 | 直播个别线路黑屏 | 保留 `streamResolve` "优先 media、master 兜底"策略；中间件对 master 的 `EXT-X-STREAM-INF` URI 同样改写 |
 | R6 | Wails v3 小版本 API 抖动（v3.0→v3.1 周更节奏） | 中 | 升级成本 | 锁定 v3.1.x；绑定层薄壳隔离，框架 API 只出现在 `main.go/app.go` |
 | R7 | GBK 站点实际为 GB18030 生僻字/双重编码 | 低 | 简介乱码 | 解码统一走 GB18030（GBK 超集），保留 forced encoding 设置项 |
 | R8 | 数据目录在 `Program Files` 下只读（现版便携形态未遇到） | 低 | 无法落盘 | 保留现版"建不出来就退默认目录"的兜底逻辑，Go 侧同实现 |
+| R9 | AssetServer 中间件对 `http.Request` 的能力矩阵限制（个别平台 POST body / Range / 流式响应不完整） | 低 | 拖拽/投屏异常 | 按官方功能矩阵核对 Range 与流式透传；受限平台退路：hls.js 自定义 loader 经 binding 取分片字节（`Media.Fetch(url) []byte`），同样不占端口 |
 
 ### 11.2 回归测试清单（阶段 6 执行）
 
@@ -536,7 +540,8 @@ graph LR
 3. 前端改动量：除 `api/` 适配层与 9.2 表中 4 个文件外，`pages/components/store/styles` 零 diff；
 4. 体积：安装包 ≤ 30 MB；常驻内存较 Electron 版下降 ≥ 40%；
 5. 代码规范：Go 侧遵循阿里巴巴编码规范（Java 规范映射到 Go 的等价条款：注释用中文文档注释、错误不忽略、包名小写）、禁止 `import *` 语义的 dot-import、新增依赖仅限 goquery / x/text / uuid；
-6. 回滚：阶段 6 前 `src/` 原样保留，任一阶段失败可退回 Electron 形态继续发版。
+6. 端口：生产运行全程不监听任何 TCP 端口（启动后 `netstat -ano` 无本进程 LISTEN 项），媒体转发全部经由同源 `/media` 中间件在进程内完成；
+7. 回滚：阶段 6 前 `src/` 原样保留，任一阶段失败可退回 Electron 形态继续发版。
 
 ---
 
@@ -547,3 +552,5 @@ graph LR
 - [Blog · Wails（v3.1.0：CGO-free builds 与 Wake）](https://wails.io/blog/)
 - [FAQ · Wails（v3 生产可用性说明）](https://v3.wails.io/faq/)
 - [Installation · Wails（Go 1.26+ 要求）](https://v3.wails.io/quick-start/installation/)
+- [Creating Custom Transport Layer · Wails（AssetServer/Transport 扩展点）](https://v3.wails.io/guides/custom-transport/)
+- [选项 · Wails 框架参考（AssetServer 支持 Middleware 挂接请求链）](https://wails.golang.ac.cn/docs/reference/options/)
