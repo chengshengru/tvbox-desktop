@@ -7,6 +7,7 @@ package spider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -95,25 +96,32 @@ func poolInvoke(ctx context.Context, kind string, site models.Site, method strin
 	if err != nil {
 		return "", err
 	}
+
+	timeout := invokeTimeout(site)
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// 同一 worker 串行调用：QuickJS 上下文 / Python 子进程均非并发安全；
+	// init 也放在锁内，防止回收器误关正在初始化的 worker。
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	// init 同组只跑一次；失败即出池，下次调用重建（§5 失败即降级）
 	e.initOnce.Do(func() {
-		e.initErr = e.engine.Init(ctx, site.Ext, site.SourceID)
+		e.initErr = e.engine.Init(cctx, site.Ext, site.SourceID)
 	})
 	if e.initErr != nil {
 		pool.discard(key, e)
 		return "", fmt.Errorf("脚本 init 失败：%w", e.initErr)
 	}
 
-	timeout := invokeTimeout(site)
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	pool.touch(key)
 	res, err := e.engine.Invoke(cctx, method, BuildInput(method, params))
 	pool.touch(key)
 	if err != nil {
+		// 超时打断后脚本状态不再可信：出池重建，防脏上下文传染后续调用（§11.2 池自愈）
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+			pool.discard(key, e)
+		}
 		return res, fmt.Errorf("Spider[%s] %s：%w", site.Name, method, err)
 	}
 	return res, nil

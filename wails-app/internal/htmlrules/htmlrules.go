@@ -187,3 +187,18 @@ func SelectAll(doc *goquery.Document, scope *goquery.Selection, rule string) *go
 	}
 	return scope.Find(selector)
 }
+
+// ExtractArgs 在已选中的元素上按伪属性列表直接取值（Spider pd 类「逐元素取值」场景）。
+// args 为空时默认取 Text；返回第一个非空候选。
+func ExtractArgs(doc *goquery.Document, el *goquery.Selection, args []string, base string) string {
+	def := []string{"Text"}
+	if len(args) > 0 {
+		def = args
+	}
+	for _, arg := range def {
+		if value := readArg(doc, el, arg, base); value != "" {
+			return value
+		}
+	}
+	return ""
+}

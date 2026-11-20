@@ -23,6 +23,8 @@ import (
 	"tvbox-desktop/internal/proxy"
 	"tvbox-desktop/internal/settings"
 	"tvbox-desktop/internal/sources"
+	"tvbox-desktop/internal/spider/bridge"
+	"tvbox-desktop/internal/spider/js"
 	"tvbox-desktop/internal/store"
 	"tvbox-desktop/models"
 	"tvbox-desktop/tvbox"
@@ -53,6 +55,13 @@ func portableDataDir() string {
 func main() {
 	dataDir := portableDataDir()
 	store.Init(dataDir)
+
+	// Spider JS 引擎注册（CGO_ENABLED=0 构建走 stub 空实现，Invoke 自动降级）
+	js.Register()
+	// 脚本日志经事件推前端控制台（§8.2 spider:log，bridge 内已限流 20 条/s）
+	bridge.LogSink = func(source, line string) {
+		tvbox.EmitEvent("spider:log", map[string]string{"source": source, "line": line})
+	}
 
 	// 对应 Electron 版启动时的 ensureReachableProxy：系统代理开着但代理软件没跑时强制直连
 	if msg := proxy.EnsureReachable(); msg != "" {
