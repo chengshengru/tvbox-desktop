@@ -145,3 +145,11 @@ func Path(name string) string {
 	defer mu.Unlock()
 	return fileOf(name)
 }
+
+// DataDir 返回当前数据目录绝对路径。
+// Spider 脚本产物缓存（data/spiders/）等派生存储用它定位，避免各自重复算便携目录。
+func DataDir() string {
+	mu.Lock()
+	defer mu.Unlock()
+	return dir
+}

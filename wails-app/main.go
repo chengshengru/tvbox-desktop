@@ -76,6 +76,7 @@ func main() {
 			application.NewService(&tvbox.Player{}),
 			application.NewService(&tvbox.Parse{}),
 			application.NewService(&tvbox.Ai{}),
+			application.NewService(&tvbox.Spider{}),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

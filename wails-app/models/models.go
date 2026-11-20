@@ -28,6 +28,8 @@ type Site struct {
 	Health      *float64          `json:"health,omitempty"`
 	Unsupported string            `json:"unsupported,omitempty"`
 	Rules       *HtmlRules        `json:"rules,omitempty"`
+	// Spider 站点脚本形态："js" / "python" / ""（不可运行）。由 config 归一化时判定。
+	Spider string `json:"spider,omitempty"`
 }
 
 // SiteStyle 海报样式（type=ratio 时按 ratio 排版）。
@@ -361,6 +363,23 @@ type AppSettings struct {
 	ExternalPlayer   ExternalPlayerConfig `json:"externalPlayer"`
 	Window           WindowBounds         `json:"window"`
 	AI               AiSettings           `json:"ai"`
+	// Spider 爬虫引擎设置（默认关闭，见设计文档第 9 节安全门槛）。
+	Spider SpiderSettings `json:"spider"`
+}
+
+// SpiderSettings 爬虫引擎设置。
+// Enabled 是任意代码执行总开关，默认关闭；开启需用户在设置页二次确认。
+type SpiderSettings struct {
+	// Enabled 总开关：关闭时 Spider 站点维持 unsupported，行为与现状一致。
+	Enabled bool `json:"enabled"`
+	// JsEngine JS 引擎开关（QuickJS CGO 产物缺失时可关）。
+	JsEngine bool `json:"jsEngine"`
+	// PythonPath 解释器路径，空=自动探测 PATH 中 python3/python。
+	PythonPath string `json:"pythonPath"`
+	// Timeout 单方法超时（秒），上限 60。
+	Timeout float64 `json:"timeout"`
+	// MemoryLimitMB JS 上下文堆上限（MB）。
+	MemoryLimitMB int `json:"memoryLimitMB"`
 }
 
 // AiSettings AI 剧情总结（DeepSeek）设置。

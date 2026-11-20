@@ -33,6 +33,8 @@ export interface Site {
   unsupported?: string
   /** 手写配置的网页解析规则 */
   rules?: HtmlRules
+  /** 脚本爬虫形态：js / python；非空表示该站点由 Spider 引擎执行 */
+  spider?: string
 }
 
 export interface HtmlRules {
@@ -361,6 +363,35 @@ export interface AppSettings {
   window: { width: number; height: number }
   /** AI 剧情总结（DeepSeek） */
   ai: AiSettings
+  /** 爬虫引擎（JS/Python 脚本站点），默认关闭，开启需二次确认 */
+  spider: SpiderSettings
+}
+
+export interface SpiderSettings {
+  /** 总开关：任意代码执行的安全门槛 */
+  enabled: boolean
+  /** JS 引擎开关（QuickJS 产物缺失时可关） */
+  jsEngine: boolean
+  /** Python 解释器路径，空=自动探测 PATH 中 python3/python */
+  pythonPath: string
+  /** 单方法超时（秒），上限 60 */
+  timeout: number
+  /** JS 上下文堆上限（MB） */
+  memoryLimitMB: number
+}
+
+/** Spider 引擎探测状态（Spider.Status 返回） */
+export interface SpiderStatus {
+  enabled: boolean
+  jsEngine: boolean
+  /** JS 引擎是否已注册可用 */
+  jsOK: boolean
+  /** Python 引擎是否已注册可用 */
+  pythonOK: boolean
+  /** 探测到的解释器版本，空表示未探测 */
+  pythonVersion: string
+  /** data/spiders/ 脚本产物缓存清单 */
+  cachedScripts: { name: string; size: number; modTime: number }[]
 }
 
 export interface AiSettings {

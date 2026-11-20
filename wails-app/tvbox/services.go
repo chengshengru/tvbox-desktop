@@ -24,6 +24,7 @@ import (
 	"tvbox-desktop/internal/settings"
 	"tvbox-desktop/internal/sites"
 	"tvbox-desktop/internal/sources"
+	"tvbox-desktop/internal/spider"
 	"tvbox-desktop/internal/stream"
 	"tvbox-desktop/models"
 )
@@ -359,4 +360,17 @@ func (Ai) Summarize(ctx context.Context, input models.AiSummaryInput) (models.Ai
 // SummarizeVisual 带画面帧的多模态总结。
 func (Ai) SummarizeVisual(ctx context.Context, input models.AiSummaryInput, frames []models.AiFrame) (models.AiSummaryResult, error) {
 	return ai.SummarizeVisual(ctx, input, frames)
+}
+
+// Spider 爬虫引擎（JS/Python 脚本站点）。
+type Spider struct{}
+
+// Status 引擎可用性 + 脚本缓存概览（设置页「爬虫引擎」探测面板）。
+func (Spider) Status(ctx context.Context) (spider.Status, error) {
+	return spider.GetStatus(), nil
+}
+
+// ClearCache 清空 data/spiders/ 脚本产物缓存。
+func (Spider) ClearCache(ctx context.Context) error {
+	return spider.ClearCache()
 }

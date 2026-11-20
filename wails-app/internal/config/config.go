@@ -18,6 +18,7 @@ import (
 	"unicode/utf16"
 
 	"tvbox-desktop/internal/httputil"
+	"tvbox-desktop/internal/spider"
 	"tvbox-desktop/models"
 )
 
@@ -381,8 +382,11 @@ func NormalizeSite(input any, ctx NormalizeContext) *models.Site {
 		Rules:       rules,
 	}
 
-	// 桌面端不支持的能力，显式标注原因，UI 上灰显而不是静默丢弃
-	if site.API == "" || unsupportedRe.MatchString(site.API) {
+	// Spider 站点（JS/Python 脚本爬虫）优先判定：功能开启时标注形态、不灰显；
+	// 关闭时（默认）行为与改造前完全一致（设计文档 §7 集成点 1、§11.2 零回归）。
+	if spiderKind := spider.Kind(*site); spiderKind != "" && spider.EnabledFor(spiderKind) {
+		site.Spider = spiderKind
+	} else if site.API == "" || unsupportedRe.MatchString(site.API) {
 		site.Unsupported = "该站点依赖内置 Spider 或本地资源，桌面端无法直接请求"
 		site.Searchable = false
 		site.QuickSearch = false

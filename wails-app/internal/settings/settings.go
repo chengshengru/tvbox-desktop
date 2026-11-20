@@ -33,6 +33,8 @@ func Default() models.AppSettings {
 		Window: models.WindowBounds{Width: 1440, Height: 900},
 		// API Key 默认留空：没填之前「AI 总结本集」按钮会提示去设置页填
 		AI: models.AiSettings{APIKey: "", Model: "deepseek-flash", BaseURL: ""},
+		// 爬虫引擎默认关闭（任意代码执行的安全门槛）；JS 引擎随 CGO 产物在，默认开
+		Spider: models.SpiderSettings{Enabled: false, JsEngine: true, PythonPath: "", Timeout: 25, MemoryLimitMB: 64},
 	}
 }
 
@@ -63,16 +65,16 @@ func overlay(base, patch map[string]any) map[string]any {
 	return base
 }
 
-// mergedMap 默认值 ← 磁盘值 ← 额外 patch；externalPlayer/window/ai 三个嵌套对象做二级合并。
+// mergedMap 默认值 ← 磁盘值 ← 额外 patch；externalPlayer/window/ai/spider 四个嵌套对象做二级合并。
 func mergedMap(patch map[string]any) map[string]any {
 	m := asMap(Default())
 	stored := store.ReadMap(name)
-	for _, key := range []string{"externalPlayer", "window", "ai"} {
+	for _, key := range []string{"externalPlayer", "window", "ai", "spider"} {
 		deepMergeInto(m, stored, key)
 	}
 	m = overlay(m, stripNested(stored))
 	if patch != nil {
-		for _, key := range []string{"externalPlayer", "window", "ai"} {
+		for _, key := range []string{"externalPlayer", "window", "ai", "spider"} {
 			deepMergeInto(m, patch, key)
 		}
 		m = overlay(m, stripNested(patch))
@@ -99,7 +101,7 @@ func deepMergeInto(dst, src map[string]any, key string) {
 	}
 }
 
-// stripNested 去掉三个已做二级合并的键，剩下的做浅合并。
+// stripNested 去掉四个已做二级合并的键，剩下的做浅合并。
 func stripNested(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
@@ -107,7 +109,7 @@ func stripNested(m map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range m {
 		switch k {
-		case "externalPlayer", "window", "ai":
+		case "externalPlayer", "window", "ai", "spider":
 			continue
 		}
 		out[k] = v

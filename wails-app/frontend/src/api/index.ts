@@ -33,6 +33,7 @@ import type {
   SearchProgress,
   SearchResponse,
   Site,
+  SpiderStatus,
   TestResult,
   VodDetail
 } from '@shared/types'
@@ -162,6 +163,12 @@ const api = {
     /** frames 是前端从 <video> 抽的帧，传给 Go 侧拼成多模态请求 */
     summarizeVisual: (input: AiSummaryInput, frames: AiFrame[]): Promise<AiSummaryResult> =>
       call('Ai', 'SummarizeVisual', input, frames)
+  },
+
+  spider: {
+    /** 引擎可用性 + 脚本缓存概览（设置页「爬虫引擎」探测面板） */
+    status: (): Promise<SpiderStatus> => call('Spider', 'Status'),
+    clearCache: (): Promise<void> => call('Spider', 'ClearCache')
   }
 }
 
