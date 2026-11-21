@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	qjs "github.com/buke/quickjs-go"
@@ -35,6 +37,8 @@ type worker struct {
 
 	// source 脚本来源标识（日志前缀）
 	source string
+	// store htmlParse 元素句柄表，随 worker 释放
+	store *bridge.HTMLStore
 	// deadline 本次调用的中断期限（看门狗）
 	deadline time.Time
 	// callCtx 当前调用上下文，透传给 bridge.req 做取消
@@ -58,6 +62,7 @@ func newWorker(_ context.Context, src spider.ScriptSource) (spider.Engine, error
 		rt:      rt,
 		ctx:     rt.NewContext(),
 		source:  srcLabel(src),
+		store:   bridge.NewHTMLStore(),
 		callCtx: context.Background(),
 	}
 	// 中断看门狗：超过 deadline 返回非 0，QuickJS 在字节码循环里掐停
@@ -188,6 +193,20 @@ func (w *worker) inject() {
 		}
 		return okJSON(v)
 	})
+	w.setGlobalFunc("__go_rsa_enc", func(args []*qjs.Value) string {
+		v, err := bridge.RsaEncode(argStr(args, 0), argStr(args, 1), argStr(args, 2))
+		if err != nil {
+			return errJSON(err)
+		}
+		return okJSON(v)
+	})
+	w.setGlobalFunc("__go_rsa_dec", func(args []*qjs.Value) string {
+		v, err := bridge.RsaDecode(argStr(args, 0), argStr(args, 1), argStr(args, 2))
+		if err != nil {
+			return errJSON(err)
+		}
+		return okJSON(v)
+	})
 
 	w.setGlobalFunc("__go_gzip_enc", func(args []*qjs.Value) string { return bridge.GzipEncode(argStr(args, 0)) })
 	w.setGlobalFunc("__go_gzip_dec", func(args []*qjs.Value) string { return bridge.GzipDecode(argStr(args, 0)) })
@@ -200,6 +219,47 @@ func (w *worker) inject() {
 		bridge.Log(w.source, argStr(args, 0))
 		return ""
 	})
+
+	// htmlParse 句柄族：ids 以 JSON 数组串进出，避免在 JS/C 边界搬运对象
+	w.setGlobalFunc("__go_html_open", func(args []*qjs.Value) string {
+		return strconv.Itoa(w.store.Open(argStr(args, 0)))
+	})
+	w.setGlobalFunc("__go_html_find", func(args []*qjs.Value) string {
+		return idsJSON(w.store.Find(idsFromJSON(argStr(args, 0)), argStr(args, 1)))
+	})
+	w.setGlobalFunc("__go_html_text", func(args []*qjs.Value) string {
+		return w.store.Text(idFromStr(argStr(args, 0)))
+	})
+	w.setGlobalFunc("__go_html_html", func(args []*qjs.Value) string {
+		return w.store.HTML(idFromStr(argStr(args, 0)))
+	})
+	w.setGlobalFunc("__go_html_attr", func(args []*qjs.Value) string {
+		return w.store.Attr(idFromStr(argStr(args, 0)), argStr(args, 1))
+	})
+}
+
+// idFromStr 句柄数字符串解析；非法返回 0（store 侧表现为空集合）。
+func idFromStr(s string) int {
+	id, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+// idsFromJSON / idsJSON 句柄数组与 JSON 串的互转（host.js wrapSel 使用）。
+func idsFromJSON(s string) []int {
+	var ids []int
+	_ = json.Unmarshal([]byte(s), &ids)
+	return ids
+}
+
+func idsJSON(ids []int) string {
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 // eval 加载一段 JS（非 await），异常转 Go error。
@@ -253,8 +313,11 @@ func (w *worker) Invoke(ctx context.Context, method string, params map[string]an
 	return v.String(), nil
 }
 
-// Close 释放上下文与运行时（QuickJS 上下文销毁即释放全部内存）。
+// Close 释放上下文与运行时（QuickJS 上下文销毁即释放全部内存），句柄表一并清空。
 func (w *worker) Close() error {
+	if w.store != nil {
+		w.store.Close()
+	}
 	if w.ctx != nil {
 		w.ctx.Close()
 	}

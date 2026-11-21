@@ -33,6 +33,8 @@ type reqOptions struct {
 	Timeout float64 `json:"timeout"`
 	// Binary true 时 body 置空、base64 填充（脚本读图片/字节流）。
 	Binary bool `json:"binary"`
+	// OkStatus 期望状态码白名单；非空且响应码不在其中时按失败抛错（猫协议语义）。
+	OkStatus []int `json:"okstatus"`
 }
 
 // Req 执行猫协议 req(url, options)：optsJSON 为 host.js 序列化的 options JSON 串，
@@ -71,6 +73,9 @@ func Req(ctx context.Context, rawURL, optsJSON string) (string, error) {
 		Header:  header,
 		Body:    body,
 		Timeout: o.Timeout,
+		// 猫协议 req 语义：非 2xx 也要拿到响应体原样透出（err 仅代表网络层失败），
+		// 是否按失败处理由 okstatus 白名单决定
+		AllowHTTPError: true,
 	})
 	if err != nil {
 		return "", err
@@ -89,7 +94,21 @@ func Req(ctx context.Context, rawURL, optsJSON string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// okstatus 白名单校验放在序列化后：错误信息带上实际状态码方便脚本排查
+	if len(o.OkStatus) > 0 && !statusAllowed(res.Status, o.OkStatus) {
+		return "", fmt.Errorf("req 状态码 %d 不在 okstatus %v 允许范围", res.Status, o.OkStatus)
+	}
 	return string(b), nil
+}
+
+// statusAllowed 响应码是否命中期望白名单。
+func statusAllowed(status int, list []int) bool {
+	for _, c := range list {
+		if c == status {
+			return true
+		}
+	}
+	return false
 }
 
 // checkPrivate 私网/环回地址守卫（§9.4 R7）。域名只拦本机形态，

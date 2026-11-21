@@ -8,7 +8,11 @@ package js
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"strings"
 	"testing"
 	"time"
@@ -172,5 +176,76 @@ function main() {
 	defer cancel()
 	if _, err := w.Invoke(ctx, "search", spider.BuildInput("search", nil)); err == nil {
 		t.Fatal("期望触发内存上限错误")
+	}
+}
+
+// htmlParse：cheerio 风格子集（select/eq/first/attr/text）
+func TestHtmlParseSample(t *testing.T) {
+	out := runSample(t, `
+function main() {
+  const html = '<ul><li class="v" data-id="7"><b>片A</b></li><li class="v" data-id="8">片B</li></ul>'
+  const items = htmlParse(html).select('.v')
+  return JSON.stringify({
+    n: items.length,
+    first: items.eq(0).text(),
+    id: items.eq(1).attr('data-id'),
+    deep: htmlParse(html).select('ul').first().select('.v').eq(1).text(),
+    empty: items.eq(9).text()
+  })
+}`, "search", nil)
+	if out["n"].(float64) != 2 {
+		t.Fatalf("select 数量错误：%v", out)
+	}
+	if out["first"] != "片A" || out["id"] != "8" || out["deep"] != "片B" {
+		t.Errorf("htmlParse 结果错误：%v", out)
+	}
+	if out["empty"] != "" {
+		t.Errorf("越界 eq 应为空串：%v", out["empty"])
+	}
+}
+
+// require shim：catExtUrl 子集可用，未知模块明确报错
+func TestRequireShim(t *testing.T) {
+	out := runSample(t, `
+function main() {
+  const ext = require('catExtUrl')
+  let msg = ''
+  try { require('fs') } catch (e) { msg = String(e.message || e) }
+  return JSON.stringify({ u: ext.getProxyUrl('http://a/b.ts'), hasReq: typeof ext.req === 'function', err: msg })
+}`, "search", nil)
+	if out["u"] != "/media?u=http%3A%2F%2Fa%2Fb.ts" {
+		t.Errorf("catExtUrl.getProxyUrl 错误：%v", out["u"])
+	}
+	if out["hasReq"] != true {
+		t.Errorf("catExtUrl.req 未透出：%v", out)
+	}
+	if !strings.Contains(out["err"].(string), "不支持的 require 模块") {
+		t.Errorf("未知模块应明确报错：%v", out["err"])
+	}
+}
+
+// RSA：脚本侧 rsaEncode/rsaDecode 双 padding 往返（密钥经 input 注入，避免内嵌转义）
+func TestRsaSample(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}))
+	privPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv)}))
+
+	out := runSample(t, `
+async function main(input) {
+  const j = JSON.parse(input)
+  const enc = rsaEncode(j.text, j.pub, 'pkcs1')
+  const enc2 = rsaEncode(j.text, j.pub, 'oaep')
+  return JSON.stringify({ dec: rsaDecode(enc, j.priv, 'pkcs1'), ok: rsaDecode(enc2, j.priv, 'oaep') === j.text })
+}`, "search", map[string]any{"text": "rsa-js", "pub": pubPEM, "priv": privPEM})
+	if out["dec"] != "rsa-js" || out["ok"] != true {
+		t.Errorf("脚本侧 RSA 往返错误：%v", out)
 	}
 }

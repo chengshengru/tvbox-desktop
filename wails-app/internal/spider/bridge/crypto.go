@@ -10,11 +10,15 @@ import (
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/rc4"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"strings"
 )
@@ -246,4 +250,116 @@ func Rc4(text, key string) (string, error) {
 	out := make([]byte, len(text))
 	c.XORKeyStream(out, []byte(text))
 	return base64.StdEncoding.EncodeToString(out), nil
+}
+
+// RsaEncode 明文 RSA 公钥加密（padding：pkcs1 默认 / oaep），输出 base64。
+// 公钥支持 PEM（PKIX "PUBLIC KEY" / PKCS1 "RSA PUBLIC KEY"）或裸 base64 DER。
+func RsaEncode(plain, pubKey, padding string) (string, error) {
+	pub, err := parseRSAPublicKey(pubKey)
+	if err != nil {
+		return "", err
+	}
+	var out []byte
+	switch strings.ToLower(strings.TrimSpace(padding)) {
+	case "", "pkcs1":
+		out, err = rsa.EncryptPKCS1v15(rand.Reader, pub, []byte(plain))
+	case "oaep":
+		out, err = rsa.EncryptOAEP(sha256.New(), rand.Reader, pub, []byte(plain), nil)
+	default:
+		return "", fmt.Errorf("不支持的 RSA padding：%s", padding)
+	}
+	if err != nil {
+		return "", fmt.Errorf("RSA 加密失败：%w", err)
+	}
+	return base64.StdEncoding.EncodeToString(out), nil
+}
+
+// RsaDecode base64 密文 RSA 私钥解密，padding 与加密侧一致。
+// 私钥支持 PEM（PKCS8 "PRIVATE KEY" / PKCS1 "RSA PRIVATE KEY"）或裸 base64 DER。
+func RsaDecode(b64Cipher, privKey, padding string) (string, error) {
+	priv, err := parseRSAPrivateKey(privKey)
+	if err != nil {
+		return "", err
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Cipher))
+	if err != nil {
+		return "", fmt.Errorf("密文非合法 base64：%w", err)
+	}
+	var out []byte
+	switch strings.ToLower(strings.TrimSpace(padding)) {
+	case "", "pkcs1":
+		out, err = rsa.DecryptPKCS1v15(rand.Reader, priv, raw)
+	case "oaep":
+		out, err = rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, raw, nil)
+	default:
+		return "", fmt.Errorf("不支持的 RSA padding：%s", padding)
+	}
+	if err != nil {
+		return "", fmt.Errorf("RSA 解密失败：%w", err)
+	}
+	return string(out), nil
+}
+
+// decodeKeyDER PEM 优先解码；不是 PEM 时按 base64 DER 兜底（猫源密钥两种写法都有）。
+func decodeKeyDER(keyPEM, wantType string) ([]byte, string, error) {
+	if block, _ := pem.Decode([]byte(strings.TrimSpace(keyPEM))); block != nil {
+		return block.Bytes, block.Type, nil
+	}
+	if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(keyPEM)); err == nil {
+		return raw, wantType, nil
+	}
+	return nil, "", fmt.Errorf("无法解析的 %s（既不是 PEM 也不是 base64 DER）", wantType)
+}
+
+// parseRSAPublicKey 解析 RSA 公钥（PKIX/PKCS1 双格式）。
+func parseRSAPublicKey(keyPEM string) (*rsa.PublicKey, error) {
+	der, typ, err := decodeKeyDER(keyPEM, "公钥")
+	if err != nil {
+		return nil, err
+	}
+	var pub any
+	switch typ {
+	case "RSA PUBLIC KEY":
+		p, e := x509.ParsePKCS1PublicKey(der)
+		if e != nil {
+			return nil, fmt.Errorf("PKCS1 公钥解析失败：%w", e)
+		}
+		return p, nil
+	default:
+		pub, err = x509.ParsePKIXPublicKey(der)
+		if err != nil {
+			return nil, fmt.Errorf("公钥解析失败（期望 PUBLIC KEY）：%w", err)
+		}
+	}
+	rpub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("不是 RSA 公钥（%T）", pub)
+	}
+	return rpub, nil
+}
+
+// parseRSAPrivateKey 解析 RSA 私钥（PKCS8/PKCS1 双格式）。
+func parseRSAPrivateKey(keyPEM string) (*rsa.PrivateKey, error) {
+	der, typ, err := decodeKeyDER(keyPEM, "私钥")
+	if err != nil {
+		return nil, err
+	}
+	switch typ {
+	case "RSA PRIVATE KEY":
+		p, e := x509.ParsePKCS1PrivateKey(der)
+		if e != nil {
+			return nil, fmt.Errorf("PKCS1 私钥解析失败：%w", e)
+		}
+		return p, nil
+	default:
+		key, e := x509.ParsePKCS8PrivateKey(der)
+		if e != nil {
+			return nil, fmt.Errorf("私钥解析失败（期望 PRIVATE KEY）：%w", e)
+		}
+		p, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("不是 RSA 私钥（%T）", key)
+		}
+		return p, nil
+	}
 }

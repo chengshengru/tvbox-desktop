@@ -6,7 +6,11 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -157,5 +161,81 @@ func TestPdfhPd(t *testing.T) {
 	// || 回退分支
 	if got := Pdfh(html, ".none&&Text||.v&&Text"); got != "A" {
 		t.Errorf("Pdfh 回退分支错误：%s", got)
+	}
+}
+
+// genRSAKeys 生成测试密钥对（PKIX 公钥 + PKCS1 私钥）。
+func genRSAKeys(t *testing.T) (pubPEM, privPEM string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("生成密钥失败：%v", err)
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("公钥序列化失败：%v", err)
+	}
+	pubPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}))
+	privPEM = string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv)}))
+	return
+}
+
+func TestRSA(t *testing.T) {
+	pubPEM, privPEM := genRSAKeys(t)
+
+	for _, padding := range []string{"pkcs1", "oaep", ""} {
+		enc, err := RsaEncode("rsa 测试", pubPEM, padding)
+		if err != nil {
+			t.Fatalf("RsaEncode(%q) 失败：%v", padding, err)
+		}
+		dec, err := RsaDecode(enc, privPEM, padding)
+		if err != nil {
+			t.Fatalf("RsaDecode(%q) 失败：%v", padding, err)
+		}
+		if dec != "rsa 测试" {
+			t.Errorf("RSA(%q) 往返错误：%s", padding, dec)
+		}
+	}
+
+	// PKCS1 形态公钥（"RSA PUBLIC KEY"）同样可用
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs1Pub := string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(&priv.PublicKey)}))
+	if _, err := RsaEncode("x", pkcs1Pub, "pkcs1"); err != nil {
+		t.Errorf("PKCS1 公钥加密失败：%v", err)
+	}
+
+	if _, err := RsaEncode("x", "not-a-key", "pkcs1"); err == nil {
+		t.Error("期望非法密钥报错")
+	}
+	if _, err := RsaEncode("x", pubPEM, "pkcs8"); err == nil {
+		t.Error("期望非法 padding 报错")
+	}
+}
+
+func TestReqOkStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	AllowPrivate = true
+	t.Cleanup(func() { AllowPrivate = false })
+
+	// 404 不在白名单 → 报错；在白名单 → 正常返回
+	if _, err := Req(context.Background(), srv.URL, `{"okstatus":[200,301]}`); err == nil {
+		t.Error("期望 okstatus 拒绝 404")
+	}
+	res, err := Req(context.Background(), srv.URL, `{"okstatus":[404]}`)
+	if err != nil {
+		t.Fatalf("okstatus 命中仍失败：%v", err)
+	}
+	if !strings.Contains(res, `"code":404`) {
+		t.Errorf("返回码异常：%s", res)
 	}
 }

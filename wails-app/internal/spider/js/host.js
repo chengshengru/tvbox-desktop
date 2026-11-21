@@ -67,6 +67,11 @@
 		str(unwrapV(__go_des_dec(str(b64), str(key), str(iv), str(mode || 'cbc'))));
 	globalThis.rc4 = (text, key) => str(unwrapV(__go_rc4(str(text), str(key))));
 
+	globalThis.rsaEncode = (text, pubKey, padding) =>
+		str(unwrapV(__go_rsa_enc(str(text), str(pubKey), str(padding || 'pkcs1'))));
+	globalThis.rsaDecode = (b64, privKey, padding) =>
+		str(unwrapV(__go_rsa_dec(str(b64), str(privKey), str(padding || 'pkcs1'))));
+
 	globalThis.gzipEncode = (s) => str(__go_gzip_enc(str(s)));
 	globalThis.gzipDecode = (s) => str(__go_gzip_dec(str(s)));
 	globalThis.zlibEncode = (s) => str(__go_zlib_enc(str(s)));
@@ -122,6 +127,45 @@
 		return 0;
 	};
 	globalThis.clearTimeout = function () {};
+
+	// htmlParse：cheerio 风格子集（select/eq/first/text/html/attr/length），
+	// 元素以数字句柄存宿主侧（bridge.HTMLStore），worker 销毁时整表释放。
+	function wrapSel(ids) {
+		const sel = {};
+		sel.length = ids.length;
+		sel.eq = function (i) { return wrapSel(i >= 0 && i < ids.length ? [ids[i]] : []); };
+		sel.first = function () { return wrapSel(ids.length ? [ids[0]] : []); };
+		sel.text = function () {
+			let acc = '';
+			for (let i = 0; i < ids.length; i++) {
+				acc += String(__go_html_text(ids[i]));
+			}
+			return acc;
+		};
+		sel.html = function () { return ids.length ? String(__go_html_html(ids[0])) : ''; };
+		sel.attr = function (k) { return ids.length ? String(__go_html_attr(ids[0], String(k))) : ''; };
+		sel.select = function (rule) {
+			return wrapSel(JSON.parse(String(__go_html_find(JSON.stringify(ids), String(rule)))));
+		};
+		return sel;
+	}
+	globalThis.htmlParse = function (html) {
+		const root = parseInt(String(__go_html_open(String(html || ''))), 10) || 0;
+		return wrapSel(root ? [root] : []);
+	};
+
+	// require shim：只内嵌常见猫公共库子集，未知模块给明确错误（§6.6 末行）
+	globalThis.require = function (name) {
+		if (name === 'catExtUrl') {
+			return {
+				getProxyUrl: globalThis.getProxyUrl,
+				req: globalThis.req,
+				host: '',
+				cat: 'cat_ext_url'
+			};
+		}
+		throw new Error('不支持的 require 模块: ' + name + '（宿主仅内嵌 catExtUrl 子集）');
+	};
 
 	// 统一调用面：main(input) 协议优先，退老式 init() 全局函数
 	globalThis.__spider_wrap = async function (input) {
